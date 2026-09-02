@@ -48,10 +48,6 @@ def fit_frequency_model(df: pd.DataFrame):
     X = sm.add_constant(df[FREQ_PREDICTORS])
     y = df["Freq"]
 
-    # Negative Binomial MLE can converge to a degenerate
-    # solution with default starting values when the data is
-    # overdispersed. A method-of-moments starting guess for alpha avoids
-    # that trap.
     mean_y, var_y = y.mean(), y.var()
     alpha_start = (var_y / mean_y - 1) / mean_y
     start_params = [np.log(mean_y)] + [0.0] * len(FREQ_PREDICTORS) + [alpha_start]
