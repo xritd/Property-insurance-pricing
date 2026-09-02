@@ -8,12 +8,13 @@ GLM for claim severity.
 
 ## Results
 
-- **Rank-ordering ability (Gini coefficient): 0.693** — comparable to or
-  better than typical real-world claims models (0.3–0.5 is a common range)
+- **Rank-ordering ability (Gini coefficient): 0.693** — strong separation
+  between relatively lower- and higher-risk policy-years
 - **Portfolio-level calibration**: predicted pure premium of $112.9M vs.
   $97.5M actual losses (1.16x), after correcting two methodological issues
   found during a self-review of the initial model (see [full report](docs/report.md))
-- Model correctly tracks actual losses closely across 8 of 10 risk deciles
+- **Deciles 2–9 track actual losses relatively closely**, while the lowest
+  and highest deciles show the largest calibration differences
 
 | Decile | Avg. Predicted | Avg. Actual |
 |---|---|---|
@@ -44,9 +45,10 @@ its [public source](https://github.com/OpenActTexts/LDACourse1) at runtime.
 
 ## Methodology highlights
 
-- **Frequency**: Negative Binomial GLM (Poisson was ruled out — claim
-  counts are ~66x overdispersed relative to their mean). Predictors:
-  log coverage, prior no-claims credit, entity type.
+- **Frequency**: Negative Binomial GLM. Claim counts are strongly
+  overdispersed relative to their mean (~66×), providing strong evidence
+  that a plain Poisson model is inappropriate. Predictors: log coverage,
+  prior no-claims credit, entity type.
 - **Severity**: Gamma GLM on claims with 'Freq > 0', weighted by claim
   count ('var_weights=Freq') since each observation is itself an average
   over multiple claims. Predictor: deductible (binned).
