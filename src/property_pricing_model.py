@@ -19,20 +19,10 @@ from scipy import stats as sps
 DATA_URL = "https://raw.githubusercontent.com/OpenActTexts/LDACourse1/main/Data/PropertyFundInsample.csv"
 
 
-# Load data
-
 def load_data() -> pd.DataFrame:
+    """Load the LGPIF property insurance dataset."""
     df = pd.read_csv(DATA_URL)
     return df
-
-
-# Frequency model (Negative Binomial GLM)
-#
-# Candidate/final predictors:
-# LnCoverage, NoClaimCredit, Fire5, and entity type dummies.
-#
-# Fire5 is tested during model selection but excluded from the final model.
-
 
 
 FREQ_TYPE_DUMMIES = ["TypeCounty", 
@@ -51,10 +41,22 @@ def fit_frequency_model(
     cluster_se: bool = True,
 ):
     """
-    Fit a Negative Binomial frequency model.
+    Fit a Negative Binomial model for annual claim frequency.
 
-    Cluster-robust standard errors are used for the final model.
-    Model-selection comparisons use the ordinary likelihood.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Policy-year data containing claim frequency and model predictors.
+    predictors : list, optional
+        Column names to use as predictors. Defaults to the final frequency
+        model predictors.
+    cluster_se : bool, default=True
+        If True, use standard errors clustered by PolicyNum.
+
+    Returns
+    -------
+    statsmodels result
+        Fitted Negative Binomial regression results.
     """
     if predictors is None:
         predictors = FREQ_PREDICTORS
@@ -90,11 +92,22 @@ def fit_frequency_model(
 
 def frequency_model_selection(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reproduce the staged frequency-model selection described in the report.
+    Compare a sequence of Negative Binomial frequency model specifications.
 
-    Each specification is compared with the previous specification using
-    a likelihood-ratio test. Cluster-robust SEs are not used here because
-    the likelihood is being compared.
+    Each specification is compared with the preceding nested specification
+    using a likelihood-ratio test. Standard errors are not clustered during
+    model selection because the comparison is based on model likelihoods.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Policy-year data containing claim frequency and candidate predictors.
+
+    Returns
+    -------
+    pd.DataFrame
+        Model specifications, log-likelihoods, likelihood-ratio statistics,
+        and p-values.
     """
     specifications = [
         ("Intercept only", []),
@@ -152,16 +165,6 @@ def frequency_model_selection(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# Severity model (Gamma GLM)
-#
-# Fit only on policy-years with at least one claim (Freq > 0).
-#
-# Candidate predictors include LnCoverage, DeductBin, Fire5,
-# NoClaimCredit, and entity type.
-#
-# Final predictor: DeductBin, with claim-count weighting.
-
-
 DEDUCT_BINS = [0, 1000, 2500, 5000, 10000, np.inf]
 DEDUCT_LABELS = ["<=1000", 
                  "1000-2500", 
@@ -171,6 +174,19 @@ DEDUCT_LABELS = ["<=1000",
 
 
 def add_deduct_bin(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a categorical deductible variable using predefined deductible bands.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Data containing a Deduct column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input data with a DeductBin column.
+    """
     df = df.copy()
     df["DeductBin"] = pd.cut(df["Deduct"], 
                              bins=DEDUCT_BINS, 
@@ -180,7 +196,24 @@ def add_deduct_bin(df: pd.DataFrame) -> pd.DataFrame:
 
 def fit_severity_model(df: pd.DataFrame):
     """
-    Fit the final Gamma GLM severity model on claims-only data.
+    Fit a Gamma GLM for average claim severity.
+
+    The model is fitted only to policy-years with at least one claim.
+    Observations are weighted by claim frequency because yAvg represents
+    an average over the number of claims reported in that policy-year.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Policy-year data containing claim frequency, average claim severity,
+        and deductible information.
+
+    Returns
+    -------
+    result : statsmodels result
+        Fitted Gamma GLM results.
+    columns : pandas.Index
+        Predictor column names used by the fitted model.
     """
     claims_df = add_deduct_bin(df[df["Freq"] > 0])
     dummies = pd.get_dummies(claims_df["DeductBin"], 
@@ -198,7 +231,29 @@ def fit_severity_model(df: pd.DataFrame):
 
 
 def deviance_f_test(deviance_reduced, df_reduced, deviance_full, df_full, dispersion):
-    """F-test for comparing nested Gamma GLMs (more reliable than a raw LR test)."""
+    """
+    Compare two nested Gamma GLMs using an F-test based on deviance reduction.
+
+    Parameters
+    ----------
+    deviance_reduced : float
+        Deviance of the reduced model.
+    df_reduced : float
+        Residual degrees of freedom of the reduced model.
+    deviance_full : float
+        Deviance of the full model.
+    df_full : float
+        Residual degrees of freedom of the full model.
+    dispersion : float
+        Estimated dispersion parameter from the full model.
+
+    Returns
+    -------
+    f_stat : float
+        F-test statistic.
+    p_value : float
+        Upper-tail p-value for the F-test.
+    """
     f_stat = ((deviance_reduced - deviance_full) / (df_reduced - df_full)) / dispersion
     p_value = sps.f.sf(f_stat, dfn=(df_reduced - df_full), dfd=df_full)
     return f_stat, p_value
@@ -206,15 +261,22 @@ def deviance_f_test(deviance_reduced, df_reduced, deviance_full, df_full, disper
 
 def severity_model_selection(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reproduce the staged severity-model selection described in the report.
+    Compare candidate Gamma GLM specifications for claim severity.
 
-    The original model-selection analysis was unweighted. Claim-count
-    weighting is applied only to the final severity model after the
-    methodological review.
+    The analysis uses policy-years with at least one claim. LnCoverage and
+    DeductBin are evaluated as alternative baseline specifications. Additional
+    predictors are then tested against the DeductBin specification using
+    F-tests based on deviance reduction.
 
-    LnCoverage and DeductBin are alternative specifications rather than
-    nested models, so the move from LnCoverage to DeductBin is treated as a
-    specification comparison rather than a formal nested-model test.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Policy-year data containing claim severity and candidate predictors.
+
+    Returns
+    -------
+    pd.DataFrame
+        Model specifications, deviances, F-test statistics, and p-values.
     """
     claims_df = add_deduct_bin(df[df["Freq"] > 0])
 
@@ -330,10 +392,30 @@ def severity_model_selection(df: pd.DataFrame) -> pd.DataFrame:
     ])
 
 
-# Combine into pure premium
-
-
 def predict_pure_premium(df: pd.DataFrame, freq_result, sev_result, sev_columns) -> pd.DataFrame:
+    """
+    Calculate predicted pure premium for each policy-year.
+
+    Pure premium is calculated as predicted claim frequency multiplied by
+    predicted average claim severity.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Policy-year data to score.
+    freq_result : statsmodels result
+        Fitted Negative Binomial frequency model.
+    sev_result : statsmodels result
+        Fitted Gamma severity model.
+    sev_columns : pandas.Index
+        Predictor columns used by the fitted severity model.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input data containing predicted frequency, predicted
+        severity, and predicted pure premium.
+    """
     df = add_deduct_bin(df).copy()
 
     Xf = sm.add_constant(df[FREQ_PREDICTORS])
@@ -341,17 +423,28 @@ def predict_pure_premium(df: pd.DataFrame, freq_result, sev_result, sev_columns)
 
     dummies = pd.get_dummies(df["DeductBin"], prefix="Ded", drop_first=True).astype(float)
     Xs = sm.add_constant(dummies)
-    Xs = Xs.reindex(columns=sev_columns, fill_value=0.0)  # align columns exactly
+    Xs = Xs.reindex(columns=sev_columns, fill_value=0.0)
     df["pred_sev"] = sev_result.predict(Xs)
 
     df["pure_premium"] = df["pred_freq"] * df["pred_sev"]
     return df
 
 
-# Evaluation: decile lift chart + Gini coefficient
-
-
 def decile_lift_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Group policy-years into pure-premium deciles and summarize predictions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Scored policy-year data containing pure_premium and actual losses.
+
+    Returns
+    -------
+    pd.DataFrame
+        Decile-level policy counts, average predicted pure premiums, and
+        average actual losses.
+    """
     df = df.copy()
     df["decile"] = pd.qcut(df["pure_premium"], 10, labels=False, duplicates="drop") + 1
     return df.groupby("decile").agg(
@@ -362,7 +455,22 @@ def decile_lift_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def gini_coefficient(df: pd.DataFrame) -> float:
-    """Gini coefficient measuring rank-ordering ability of predicted pure premium."""
+    """
+    Calculate the Gini coefficient for predicted pure-premium ranking.
+
+    A higher value indicates better separation of policy-years by observed
+    losses when ranked by predicted pure premium.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Scored policy-year data containing pure_premium and actual losses.
+
+    Returns
+    -------
+    float
+        Gini coefficient.
+    """
     sorted_df = df.sort_values("pure_premium").reset_index(drop=True)
     cum_policies_pct = (np.arange(len(sorted_df)) + 1) / len(sorted_df)
     cum_actual_pct = sorted_df["y"].cumsum() / sorted_df["y"].sum()
@@ -370,10 +478,8 @@ def gini_coefficient(df: pd.DataFrame) -> float:
     return 1 - 2 * area_under_lorenz
 
 
-# Run the full pipeline
-
-
 def main():
+    """Run the complete modeling and evaluation pipeline."""
     df = load_data()
     print(f"Loaded {len(df)} policy-year rows.\n")
 
