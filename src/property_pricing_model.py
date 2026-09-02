@@ -28,7 +28,11 @@ def load_data() -> pd.DataFrame:
 
 # Frequency model (Negative Binomial GLM)
 #
-# Final predictors: LnCoverage, NoClaimCredit, entity type dummies
+# Candidate/final predictors:
+# LnCoverage, NoClaimCredit, Fire5, and entity type dummies.
+#
+# Fire5 is tested during model selection but excluded from the final model.
+
 
 
 FREQ_TYPE_DUMMIES = ["TypeCounty", 
@@ -41,30 +45,121 @@ FREQ_PREDICTORS = ["LnCoverage",
                    "NoClaimCredit"] + FREQ_TYPE_DUMMIES
 
 
-def fit_frequency_model(df: pd.DataFrame):
+def fit_frequency_model(
+    df: pd.DataFrame,
+    predictors=None,
+    cluster_se: bool = True,
+):
     """
-    Fit the final Negative Binomial frequency model on the full dataset.
+    Fit a Negative Binomial frequency model.
+
+    Cluster-robust standard errors are used for the final model.
+    Model-selection comparisons use the ordinary likelihood.
     """
-    X = sm.add_constant(df[FREQ_PREDICTORS])
+    if predictors is None:
+        predictors = FREQ_PREDICTORS
+
+    X = sm.add_constant(df[predictors])
     y = df["Freq"]
 
     mean_y, var_y = y.mean(), y.var()
     alpha_start = (var_y / mean_y - 1) / mean_y
-    start_params = [np.log(mean_y)] + [0.0] * len(FREQ_PREDICTORS) + [alpha_start]
+    start_params = [np.log(mean_y)] + [0.0] * len(predictors) + [alpha_start]
 
     model = sm.NegativeBinomial(y, X)
-    result = model.fit(
-        start_params=start_params, method="bfgs", maxiter=300, disp=0,
-        cov_type="cluster", cov_kwds={"groups": df["PolicyNum"]},
-    )
+
+    if cluster_se:
+        result = model.fit(
+            start_params=start_params,
+            method="bfgs",
+            maxiter=300,
+            disp=0,
+            cov_type="cluster",
+            cov_kwds={"groups": df["PolicyNum"]},
+        )
+    else:
+        result = model.fit(
+            start_params=start_params,
+            method="bfgs",
+            maxiter=300,
+            disp=0,
+        )
+
     return result
+
+
+def frequency_model_selection(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reproduce the staged frequency-model selection described in the report.
+
+    Each specification is compared with the previous specification using
+    a likelihood-ratio test. Cluster-robust SEs are not used here because
+    the likelihood is being compared.
+    """
+    specifications = [
+        ("Intercept only", []),
+        ("LnCoverage", ["LnCoverage"]),
+        (
+            "LnCoverage + NoClaimCredit",
+            ["LnCoverage", "NoClaimCredit"],
+        ),
+        (
+            "LnCoverage + NoClaimCredit + Fire5",
+            ["LnCoverage", "NoClaimCredit", "Fire5"],
+        ),
+        (
+            "LnCoverage + NoClaimCredit + EntityType",
+            [
+                "LnCoverage",
+                "NoClaimCredit",
+                "TypeCounty",
+                "TypeMisc",
+                "TypeSchool",
+                "TypeTown",
+                "TypeVillage",
+            ],
+        ),
+    ]
+
+    rows = []
+    previous_result = None
+
+    for step, (name, predictors) in enumerate(specifications, start=1):
+        result = fit_frequency_model(
+            df,
+            predictors=predictors,
+            cluster_se=False,
+        )
+
+        if previous_result is None:
+            lr_stat = np.nan
+            p_value = np.nan
+        else:
+            lr_stat = 2 * (result.llf - previous_result.llf)
+            df_difference = result.df_model - previous_result.df_model
+            p_value = sps.chi2.sf(lr_stat, df_difference)
+
+        rows.append({
+            "Step": step,
+            "Specification": name,
+            "Log-likelihood": result.llf,
+            "LR statistic": lr_stat,
+            "p-value": p_value,
+        })
+
+        previous_result = result
+
+    return pd.DataFrame(rows)
 
 
 # Severity model (Gamma GLM)
 #
 # Fit only on policy-years with at least one claim (Freq > 0).
 #
-# Final predictor: Deduct, binned into 5 categories.
+# Candidate predictors include LnCoverage, DeductBin, Fire5,
+# NoClaimCredit, and entity type.
+#
+# Final predictor: DeductBin, with claim-count weighting.
 
 
 DEDUCT_BINS = [0, 1000, 2500, 5000, 10000, np.inf]
@@ -107,6 +202,132 @@ def deviance_f_test(deviance_reduced, df_reduced, deviance_full, df_full, disper
     f_stat = ((deviance_reduced - deviance_full) / (df_reduced - df_full)) / dispersion
     p_value = sps.f.sf(f_stat, dfn=(df_reduced - df_full), dfd=df_full)
     return f_stat, p_value
+
+
+def severity_model_selection(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reproduce the staged severity-model selection described in the report.
+
+    The original model-selection analysis was unweighted. Claim-count
+    weighting is applied only to the final severity model after the
+    methodological review.
+
+    LnCoverage and DeductBin are alternative specifications rather than
+    nested models, so the move from LnCoverage to DeductBin is treated as a
+    specification comparison rather than a formal nested-model test.
+    """
+    claims_df = add_deduct_bin(df[df["Freq"] > 0])
+
+    def fit(formula):
+        return sm.formula.glm(
+            formula=formula,
+            data=claims_df,
+            family=sm.families.Gamma(
+                link=sm.families.links.Log()
+            ),
+        ).fit()
+
+    intercept = fit("yAvg ~ 1")
+
+    coverage = fit("yAvg ~ LnCoverage")
+
+    deductible = fit("yAvg ~ C(DeductBin)")
+
+    deductible_fire = fit(
+        "yAvg ~ C(DeductBin) + Fire5"
+    )
+
+    deductible_credit = fit(
+        "yAvg ~ C(DeductBin) + NoClaimCredit"
+    )
+
+    deductible_entity = fit(
+        """
+        yAvg ~ C(DeductBin)
+             + TypeCounty
+             + TypeMisc
+             + TypeSchool
+             + TypeTown
+             + TypeVillage
+        """
+    )
+
+    f_coverage, p_coverage = deviance_f_test(
+        intercept.deviance,
+        intercept.df_resid,
+        coverage.deviance,
+        coverage.df_resid,
+        coverage.scale,
+    )
+
+    f_fire, p_fire = deviance_f_test(
+        deductible.deviance,
+        deductible.df_resid,
+        deductible_fire.deviance,
+        deductible_fire.df_resid,
+        deductible_fire.scale,
+    )
+
+    f_credit, p_credit = deviance_f_test(
+        deductible.deviance,
+        deductible.df_resid,
+        deductible_credit.deviance,
+        deductible_credit.df_resid,
+        deductible_credit.scale,
+    )
+
+    f_entity, p_entity = deviance_f_test(
+        deductible.deviance,
+        deductible.df_resid,
+        deductible_entity.deviance,
+        deductible_entity.df_resid,
+        deductible_entity.scale,
+    )
+
+    return pd.DataFrame([
+        {
+            "Step": 1,
+            "Specification": "Intercept only",
+            "Deviance": intercept.deviance,
+            "F statistic": np.nan,
+            "p-value": np.nan,
+        },
+        {
+            "Step": 2,
+            "Specification": "LnCoverage",
+            "Deviance": coverage.deviance,
+            "F statistic": f_coverage,
+            "p-value": p_coverage,
+        },
+        {
+            "Step": 3,
+            "Specification": "DeductBin (replaces LnCoverage)",
+            "Deviance": deductible.deviance,
+            "F statistic": np.nan,
+            "p-value": np.nan,
+        },
+        {
+            "Step": 4,
+            "Specification": "DeductBin + Fire5",
+            "Deviance": deductible_fire.deviance,
+            "F statistic": f_fire,
+            "p-value": p_fire,
+        },
+        {
+            "Step": 5,
+            "Specification": "DeductBin + NoClaimCredit",
+            "Deviance": deductible_credit.deviance,
+            "F statistic": f_credit,
+            "p-value": p_credit,
+        },
+        {
+            "Step": 6,
+            "Specification": "DeductBin + EntityType",
+            "Deviance": deductible_entity.deviance,
+            "F statistic": f_entity,
+            "p-value": p_entity,
+        },
+    ])
 
 
 # Combine into pure premium
@@ -156,7 +377,26 @@ def main():
     df = load_data()
     print(f"Loaded {len(df)} policy-year rows.\n")
 
+    print("=== Frequency model selection ===")
+    print(
+        frequency_model_selection(df).to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
+        )
+    )
+    print()
+
+    print("=== Severity model selection ===")
+    print(
+        severity_model_selection(df).to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}",
+        )
+    )
+    print()
+
     freq_result = fit_frequency_model(df)
+
     print("=== Frequency model (Negative Binomial) ===")
     print(freq_result.summary())
     print()
